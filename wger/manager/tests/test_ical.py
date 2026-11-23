@@ -88,6 +88,11 @@ class WorkoutICalExportTestCase(WgerTestCase):
         calendar = Calendar.from_ical(response.content)
         return [component for component in calendar.walk('VEVENT')]
 
+    def export_events_as_owner(self):
+        """Log in as the routine's owner, export it and return the parsed events"""
+        self.user_login('test')
+        return self.get_events(self.export_ical(self.routine.pk))
+
     def test_export_ical_anonymous(self):
         """An anonymous user cannot export a routine"""
         response = self.export_ical(self.routine.pk)
@@ -116,9 +121,7 @@ class WorkoutICalExportTestCase(WgerTestCase):
         Given a routine with training and rest days, the export contains exactly one
         all-day event per training day, on the right date, named after the day
         """
-        self.user_login('test')
-
-        events = self.get_events(self.export_ical(self.routine.pk))
+        events = self.export_events_as_owner()
 
         actual = [
             (event.decoded('DTSTART'), str(event['SUMMARY']), str(event['DESCRIPTION']))
@@ -131,9 +134,7 @@ class WorkoutICalExportTestCase(WgerTestCase):
         The exported dates are the non-rest days of the routine's date sequence, the
         same source the rest of the application uses for its calendar
         """
-        self.user_login('test')
-
-        events = self.get_events(self.export_ical(self.routine.pk))
+        events = self.export_events_as_owner()
 
         expected_dates = [
             day_data.date
@@ -144,9 +145,7 @@ class WorkoutICalExportTestCase(WgerTestCase):
 
     def test_export_skips_rest_days(self):
         """Rest days never show up in the user's calendar"""
-        self.user_login('test')
-
-        events = self.get_events(self.export_ical(self.routine.pk))
+        events = self.export_events_as_owner()
 
         exported_dates = {event.decoded('DTSTART') for event in events}
         self.assertNotIn(datetime.date(2024, 3, 5), exported_dates)
@@ -155,9 +154,7 @@ class WorkoutICalExportTestCase(WgerTestCase):
 
     def test_export_events_have_unique_uids(self):
         """Every event has a UID, and no two events in one export share one"""
-        self.user_login('test')
-
-        events = self.get_events(self.export_ical(self.routine.pk))
+        events = self.export_events_as_owner()
 
         uids = [str(event['UID']) for event in events]
         self.assertEqual(len(uids), len(self.EXPECTED_EVENTS))
