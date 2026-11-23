@@ -496,9 +496,18 @@ class TestSyncIngredientsFromDumpConflicts(BaseTestCase, TransactionTestCase):
     def test_insert_mode_fallback_saves_new_rows_and_counts_conflicts_as_errors(self):
         """
         Given a dump whose first ingredient already exists in the database, the bulk
-        insert fails; the new ingredient is still saved with its weight units and
-        the duplicate is reported as an error instead of aborting the import
+        insert of the final batch fails; the new ingredient is still saved with its
+        weight units and the duplicate is reported as an error instead of aborting
+        the import
         """
+        self._assert_conflict_is_counted_and_new_row_kept()
+
+    @patch('wger.nutrition.sync.BULK_SIZE', 1)
+    def test_insert_mode_fallback_for_full_batches_counts_conflicts_as_errors(self):
+        """Same as above, but the conflicting batch is flushed inside the read loop"""
+        self._assert_conflict_is_counted_and_new_row_kept()
+
+    def _assert_conflict_is_counted_and_new_row_kept(self):
         existing_uuid = SAMPLE_INGREDIENTS[0]['uuid']
         new_entry = {
             **SAMPLE_INGREDIENTS[0],
