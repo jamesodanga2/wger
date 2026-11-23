@@ -591,10 +591,11 @@ def sync_ingredients_from_dump(
         try:
             Ingredient.objects.bulk_create([item[0] for item in bulk_bucket])
             uuids = [item[0].uuid for item in bulk_bucket]
-            saved = {i.uuid: i for i in Ingredient.objects.filter(uuid__in=uuids)}
+            saved = {str(i.uuid): i for i in Ingredient.objects.filter(uuid__in=uuids)}
             for ingredient, units_data in bulk_bucket:
-                if units_data is not None and ingredient.uuid in saved:
-                    sync_weight_units(saved[ingredient.uuid], units_data)
+                refetched = saved.get(str(ingredient.uuid))
+                if units_data is not None and refetched is not None:
+                    sync_weight_units(refetched, units_data)
             count += len(bulk_bucket)
         except Exception:
             for ingredient, units_data in bulk_bucket:
