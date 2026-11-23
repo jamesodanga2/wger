@@ -30,10 +30,17 @@ from unittest.mock import (
 from django.core.files.storage import default_storage
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import SimpleTestCase
+from django.db import IntegrityError
+from django.test import (
+    SimpleTestCase,
+    TransactionTestCase,
+)
 
 # wger
-from wger.core.tests.base_testcase import WgerTestCase
+from wger.core.tests.base_testcase import (
+    BaseTestCase,
+    WgerTestCase,
+)
 from wger.nutrition.consts import SyncMode
 from wger.nutrition.models import Ingredient
 from wger.nutrition.sync import (
@@ -278,8 +285,93 @@ class TestSyncIngredientsFromDump(WgerTestCase):
 
             self.assertEqual(count, 2)
             self.assertEqual(Ingredient.objects.count(), initial_count + 2)
+            self.assert_weight_units_match_dump(SAMPLE_INGREDIENTS)
         finally:
             Path(file_path).unlink()
+
+    def assert_weight_units_match_dump(self, dump_entries):
+        """Each imported ingredient has exactly the weight units defined in the dump."""
+        for entry in dump_entries:
+            ingredient = Ingredient.objects.get(uuid=entry['uuid'])
+            actual = sorted(
+                (unit.name, unit.gram) for unit in ingredient.ingredientweightunit_set.all()
+            )
+            expected = sorted((unit['name'], unit['gram']) for unit in entry['weight_units'])
+            self.assertEqual(actual, expected, f'weight units of {entry["uuid"]}')
+
+    def _delete_conflicting_fixture_ingredient(self):
+        Ingredient.objects.filter(uuid=SAMPLE_INGREDIENTS[0]['uuid']).delete()
+
+    def test_insert_mode_saves_weight_units_when_dump_is_smaller_than_batch(self):
+        """
+        Given a dump with fewer rows than BULK_SIZE, INSERT mode imports everything
+        in the final flush, and the weight units must be saved there too
+        """
+        self._delete_conflicting_fixture_ingredient()
+        file_path = self._create_dump_file()
+        self.addCleanup(Path(file_path).unlink)
+
+        count = sync_ingredients_from_dump(lambda x: x, file_path, mode=SyncMode.INSERT)
+
+        self.assertEqual(count, 2)
+        self.assert_weight_units_match_dump(SAMPLE_INGREDIENTS)
+
+    @patch('wger.nutrition.sync.BULK_SIZE', 1)
+    def test_insert_mode_saves_weight_units_for_full_batches(self):
+        """
+        Given batches that fill up during the read loop, every batch saves the
+        weight units of its ingredients
+        """
+        self._delete_conflicting_fixture_ingredient()
+        file_path = self._create_dump_file()
+        self.addCleanup(Path(file_path).unlink)
+
+        count = sync_ingredients_from_dump(lambda x: x, file_path, mode=SyncMode.INSERT)
+
+        self.assertEqual(count, 2)
+        self.assert_weight_units_match_dump(SAMPLE_INGREDIENTS)
+
+    def test_insert_mode_falls_back_to_single_saves_when_bulk_create_fails(self):
+        """
+        When the bulk insert of the final batch fails, each ingredient is saved on its
+        own, keeping its weight units, and the import still reports every row
+        """
+        self._delete_conflicting_fixture_ingredient()
+        file_path = self._create_dump_file()
+        self.addCleanup(Path(file_path).unlink)
+        output = []
+
+        with patch.object(
+            Ingredient.objects,
+            'bulk_create',
+            side_effect=IntegrityError('simulated bulk failure'),
+        ) as mock_bulk_create:
+            count = sync_ingredients_from_dump(output.append, file_path, mode=SyncMode.INSERT)
+
+        # One bulk attempt for the single final batch, so the fallback really ran
+        mock_bulk_create.assert_called_once()
+        self.assertEqual(count, 2)
+        self.assertIn('Processed 2 ingredients (0 errors)', output[-1])
+        self.assert_weight_units_match_dump(SAMPLE_INGREDIENTS)
+
+    @patch('wger.nutrition.sync.BULK_SIZE', 1)
+    def test_insert_mode_falls_back_to_single_saves_for_full_batches(self):
+        """Same fallback as above, but for a batch flushed inside the read loop"""
+        self._delete_conflicting_fixture_ingredient()
+        file_path = self._create_dump_file()
+        self.addCleanup(Path(file_path).unlink)
+
+        with patch.object(
+            Ingredient.objects,
+            'bulk_create',
+            side_effect=IntegrityError('simulated bulk failure'),
+        ) as mock_bulk_create:
+            count = sync_ingredients_from_dump(lambda x: x, file_path, mode=SyncMode.INSERT)
+
+        # One bulk attempt per single-row batch, so both batches used the fallback
+        self.assertEqual(mock_bulk_create.call_count, 2)
+        self.assertEqual(count, 2)
+        self.assert_weight_units_match_dump(SAMPLE_INGREDIENTS)
 
     def test_insert_mode_skips_negative_nutrients(self):
         """Invalid nutrients do not enter the bulk insert or block valid records."""
@@ -394,6 +486,72 @@ class TestSyncIngredientsFromDump(WgerTestCase):
             )
         finally:
             Path(tmp.name).unlink()
+
+
+class TestSyncIngredientsFromDumpConflicts(BaseTestCase, TransactionTestCase):
+    """
+    INSERT-mode import against real database conflicts.
+
+    This needs a TransactionTestCase: inside a regular TestCase the failed bulk
+    insert would poison the wrapping transaction, which never happens when the
+    command runs in production (autocommit).
+    """
+
+    def test_insert_mode_fallback_saves_new_rows_and_counts_conflicts_as_errors(self):
+        """
+        Given a dump whose first ingredient already exists in the database, the bulk
+        insert of the final batch fails; the new ingredient is still saved with its
+        weight units and the duplicate is reported as an error instead of aborting
+        the import
+        """
+        self._assert_conflict_is_counted_and_new_row_kept()
+
+    @patch('wger.nutrition.sync.BULK_SIZE', 1)
+    def test_insert_mode_fallback_for_full_batches_counts_conflicts_as_errors(self):
+        """Same as above, but the conflicting batch is flushed inside the read loop"""
+        self._assert_conflict_is_counted_and_new_row_kept()
+
+    def _assert_conflict_is_counted_and_new_row_kept(self):
+        existing_uuid = SAMPLE_INGREDIENTS[0]['uuid']
+        new_entry = {
+            **SAMPLE_INGREDIENTS[0],
+            'uuid': 'c0ffee00-0000-4000-8000-000000000001',
+            'code': '0000000000017',
+            'name': 'New ingredient with a weight unit',
+            'weight_units': [
+                {
+                    'id': 101,
+                    'uuid': 'c0ffee00-0000-4000-8000-000000000002',
+                    'name': 'Slice',
+                    'gram': 30,
+                },
+            ],
+        }
+        existing_name = Ingredient.objects.get(uuid=existing_uuid).name
+        self.assertNotEqual(existing_name, SAMPLE_INGREDIENTS[0]['name'])
+        initial_count = Ingredient.objects.count()
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.jsonl.gz', delete=False)
+        tmp.close()
+        self.addCleanup(Path(tmp.name).unlink)
+        _write_dump(tmp.name, [SAMPLE_INGREDIENTS[0], new_entry])
+        output = []
+
+        count = sync_ingredients_from_dump(output.append, tmp.name, mode=SyncMode.INSERT)
+
+        self.assertEqual(count, 1)
+        self.assertIn('Processed 1 ingredients (1 errors)', output[-1])
+        self.assertEqual(Ingredient.objects.count(), initial_count + 1)
+
+        # The existing ingredient was not overwritten by the INSERT import
+        self.assertEqual(Ingredient.objects.get(uuid=existing_uuid).name, existing_name)
+
+        new_ingredient = Ingredient.objects.get(uuid=new_entry['uuid'])
+        self.assertEqual(new_ingredient.name, 'New ingredient with a weight unit')
+        self.assertEqual(
+            list(new_ingredient.ingredientweightunit_set.values_list('name', 'gram')),
+            [('Slice', 30)],
+        )
 
 
 class TestDownloadIngredientDump(WgerTestCase):
