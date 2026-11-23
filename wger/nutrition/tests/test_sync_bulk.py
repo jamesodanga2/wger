@@ -345,9 +345,11 @@ class TestSyncIngredientsFromDump(WgerTestCase):
             Ingredient.objects,
             'bulk_create',
             side_effect=IntegrityError('simulated bulk failure'),
-        ):
+        ) as mock_bulk_create:
             count = sync_ingredients_from_dump(output.append, file_path, mode=SyncMode.INSERT)
 
+        # One bulk attempt for the single final batch, so the fallback really ran
+        mock_bulk_create.assert_called_once()
         self.assertEqual(count, 2)
         self.assertIn('Processed 2 ingredients (0 errors)', output[-1])
         self.assert_weight_units_match_dump(SAMPLE_INGREDIENTS)
@@ -363,9 +365,11 @@ class TestSyncIngredientsFromDump(WgerTestCase):
             Ingredient.objects,
             'bulk_create',
             side_effect=IntegrityError('simulated bulk failure'),
-        ):
+        ) as mock_bulk_create:
             count = sync_ingredients_from_dump(lambda x: x, file_path, mode=SyncMode.INSERT)
 
+        # One bulk attempt per single-row batch, so both batches used the fallback
+        self.assertEqual(mock_bulk_create.call_count, 2)
         self.assertEqual(count, 2)
         self.assert_weight_units_match_dump(SAMPLE_INGREDIENTS)
 
@@ -523,7 +527,8 @@ class TestSyncIngredientsFromDumpConflicts(BaseTestCase, TransactionTestCase):
                 },
             ],
         }
-        self.assertTrue(Ingredient.objects.filter(uuid=existing_uuid).exists())
+        existing_name = Ingredient.objects.get(uuid=existing_uuid).name
+        self.assertNotEqual(existing_name, SAMPLE_INGREDIENTS[0]['name'])
         initial_count = Ingredient.objects.count()
 
         tmp = tempfile.NamedTemporaryFile(suffix='.jsonl.gz', delete=False)
@@ -539,7 +544,7 @@ class TestSyncIngredientsFromDumpConflicts(BaseTestCase, TransactionTestCase):
         self.assertEqual(Ingredient.objects.count(), initial_count + 1)
 
         # The existing ingredient was not overwritten by the INSERT import
-        self.assertEqual(Ingredient.objects.get(uuid=existing_uuid).name, 'Test ingredient 1')
+        self.assertEqual(Ingredient.objects.get(uuid=existing_uuid).name, existing_name)
 
         new_ingredient = Ingredient.objects.get(uuid=new_entry['uuid'])
         self.assertEqual(new_ingredient.name, 'New ingredient with a weight unit')
